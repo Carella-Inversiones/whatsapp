@@ -21,7 +21,8 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  Browsers
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
@@ -29,17 +30,9 @@ const http = require('http');
 
 /* ----------------- CONFIG (vía variables de entorno en Railway) ----------------- */
 const CONFIG = {
-  // URL de la Web App de Apps Script (la que termina en /exec).
   WEBHOOK_URL: process.env.SHEET_WEBHOOK_URL,
-
-  // Secreto compartido con la Web App (mismo valor en los dos lados).
   SECRET: process.env.SECRET || '',
-
-  // Carpeta de sesión. En Railway apuntá esto al volumen persistente,
-  // ej: /data/auth_info
   AUTH_DIR: process.env.AUTH_DIR || './auth_info',
-
-  // Palabras clave para detectar de qué portal viene el lead.
   PORTALES: {
     'Zonaprop': ['zonaprop'],
     'Argenprop': ['argenprop'],
@@ -77,13 +70,25 @@ async function enviarASheet(data) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...data, secret: CONFIG.SECRET })
     });
-    console.log('→ Sheet:', res.status, await res.text());
+    console.log('-> Sheet:', res.status, await res.text());
   } catch (e) {
     console.error('Error enviando a Sheet:', e.message);
   }
 }
 
 /* ----------------- WhatsApp ----------------- */
+// Freno de reconexion: garantiza UN solo reintento a la vez, con espera.
+let reconnectTimer = null;
+
+function programarReconexion() {
+  if (reconnectTimer) return;               // ya hay uno agendado, no amontonar
+  console.log('Reintentando conexion en 5 segundos...');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    start();
+  }, 5000);
+}
+
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(CONFIG.AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -92,7 +97,7 @@ async function start() {
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Carella CRM', 'Chrome', '1.0.0'],
+    browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false
   });
 
@@ -102,22 +107,25 @@ async function start() {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      console.log('\n📲 Escaneá este QR desde el celu:');
-      console.log('   WhatsApp → Dispositivos vinculados → Vincular dispositivo\n');
+      console.log('\n[QR] Escanea este QR desde el celu:');
+      console.log('   WhatsApp -> Dispositivos vinculados -> Vincular dispositivo\n');
       qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'open') {
+      console.log('OK Conectado a WhatsApp. El celular sigue funcionando normal.');
     }
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const reconectar = code !== DisconnectReason.loggedOut;
-      console.log('Conexión cerrada. ¿Reconectar?', reconectar);
-      if (reconectar) {
-        start();
-      } else {
-        console.log('Sesión cerrada (logout). Borrá la carpeta de sesión y re-escaneá el QR.');
+
+      if (code === DisconnectReason.loggedOut) {
+        console.log('Sesion cerrada (logout). Borra la carpeta de sesion y re-escanea el QR.');
+        return;   // NO reconectar: la sesion murio, hay que re-vincular a mano
       }
-    } else if (connection === 'open') {
-      console.log('✅ Conectado a WhatsApp. El celular sigue funcionando normal.');
+
+      console.log('Conexion cerrada (codigo ' + code + ').');
+      programarReconexion();   // un solo reintento, con freno
     }
   });
 
@@ -126,17 +134,16 @@ async function start() {
 
     for (const msg of messages) {
       if (!msg.message) continue;
-      if (msg.key.fromMe) continue;                 // ignorar lo que mando yo
-
+      if (msg.key.fromMe) continue;
       const jid = msg.key.remoteJid || '';
-      if (jid.endsWith('@g.us')) continue;           // ignorar grupos
-      if (jid === 'status@broadcast') continue;      // ignorar estados
+      if (jid.endsWith('@g.us')) continue;
+      if (jid === 'status@broadcast') continue;
 
       const texto = extraerTexto(msg.message);
       if (!texto) continue;
 
       const portal = detectarPortal(texto);
-      if (!portal) continue;                         // solo nos importan los portales
+      if (!portal) continue;
 
       const telefono = jid.split('@')[0];
       const nombre = msg.pushName || '';
@@ -144,13 +151,13 @@ async function start() {
         timeZone: 'America/Argentina/Buenos_Aires'
       });
 
-      console.log(`📌 Lead ${portal} — ${nombre} (${telefono})`);
+      console.log('Lead ' + portal + ' - ' + nombre + ' (' + telefono + ')');
       await enviarASheet({ fecha, telefono, nombre, portal, mensaje: texto });
     }
   });
 }
 
-/* ----------------- Servidor mínimo (Railway necesita un puerto abierto) ----------------- */
+/* ----------------- Servidor minimo (Railway necesita un puerto abierto) ----------------- */
 http
   .createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
